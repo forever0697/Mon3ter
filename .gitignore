@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+
+# Models (large files)
+models/
+
+# Runtime data
+data/chroma/
+data/cache/
+data/logs/
+data/summaries.db
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Electron (future)
+frontend/electron-app/node_modules/
+frontend/electron-app/dist/

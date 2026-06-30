@@ -19,6 +19,8 @@ from typing import Any, AsyncIterator, Literal
 import yaml
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from mon3ter.core.clock import now_iso, now as clock_now
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 推理引擎相关
@@ -62,6 +64,7 @@ class ModelLoadConfig(BaseModel):
     n_threads: int | None = None                          # CPU线程数, None=自动
     verbose: bool = False
     chat_format: str = "chatml"
+    use_worker: bool = False                              # True=子进程隔离, False=同进程加载
 
     @field_validator("model_path")
     @classmethod
@@ -155,7 +158,11 @@ class MemoryItem:
     def recency_days(self) -> float:
         try:
             dt = datetime.fromisoformat(self.timestamp)
-            return (datetime.now() - dt).total_seconds() / 86400.0
+            # 确保两者都是 aware 或都是 naive 后再相减
+            now = clock_now()
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=now.tzinfo)
+            return (now - dt).total_seconds() / 86400.0
         except (ValueError, TypeError):
             return 999.0
 
@@ -167,15 +174,15 @@ class UserFact:
     value: str
     source: str = ""
     confidence: float = 1.0
-    created_at: str = field(default_factory=lambda: datetime.now().isoformat())
-    updated_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    created_at: str = field(default_factory=now_iso)
+    updated_at: str = field(default_factory=now_iso)
 
 
 @dataclass(slots=True)
 class ConversationSummary:
     """对话摘要。"""
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    timestamp: str = field(default_factory=lambda: datetime.now().isoformat())
+    timestamp: str = field(default_factory=now_iso)
     summary: str = ""
     topics: list[str] = field(default_factory=list)
     emotion_at_time: str = ""
@@ -193,12 +200,23 @@ class ConversationContext:
 
     分两段管理:
       prefix — 固定前缀（System Prompt, 角色卡, 环境信息）
-      history — 可滚动的对话历史窗口（最多 max_turns 轮）
+      _rounds — 对话轮次列表，每轮为 (user_msg, assistant_msg) 元组
+
+    采用轮索引管理而非平铺配对删除——确保 system/tool 消息混入时不会错位。
     """
     session_id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     prefix: list[Message] = field(default_factory=list)
-    history: list[Message] = field(default_factory=list)
+    _rounds: list[tuple[Message, Message]] = field(default_factory=list)
     max_turns: int = 20
+
+    @property
+    def history(self) -> list[Message]:
+        """将轮次展平为 Message 列表，供推理使用。"""
+        result: list[Message] = []
+        for user_msg, assistant_msg in self._rounds:
+            result.append(user_msg)
+            result.append(assistant_msg)
+        return result
 
     def all_messages(self) -> list[Message]:
         """返回完整消息列表（prefix + history），供推理使用。"""
@@ -206,34 +224,20 @@ class ConversationContext:
 
     @property
     def turn_count(self) -> int:
-        user_msgs = [m for m in self.history if m.role == "user"]
-        return len(user_msgs)
+        return len(self._rounds)
 
     def append(self, user_msg: Message, assistant_msg: Message) -> None:
-        """追加一轮对话到 history，超出上限时丢弃最早一轮。"""
-        self.history.append(user_msg)
-        self.history.append(assistant_msg)
+        """追加一轮对话，超出上限时丢弃最早一轮。"""
+        self._rounds.append((user_msg, assistant_msg))
         self._trim()
 
     def _trim(self) -> None:
-        """丢弃 history 中最早的一轮 (user+assistant 配对)。"""
-        while self.turn_count > self.max_turns:
-            removed = 0
-            for i, m in enumerate(self.history):
-                if m.role == "user":
-                    del self.history[i]
-                    removed += 1
-                    break
-            for i, m in enumerate(self.history):
-                if m.role == "assistant":
-                    del self.history[i]
-                    removed += 1
-                    break
-            if removed < 2:
-                break
+        """丢弃最早一轮——O(1) pop(0)，不受消息类型干扰。"""
+        while len(self._rounds) > self.max_turns:
+            self._rounds.pop(0)
 
     def clear(self) -> None:
-        self.history.clear()
+        self._rounds.clear()
         self.session_id = uuid.uuid4().hex[:8]
 
 
@@ -249,7 +253,7 @@ class WeatherInfo:
     description: str = ""
     humidity: int = 0
     wind_speed_kmh: float = 0.0
-    fetched_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    fetched_at: str = field(default_factory=now_iso)
 
     def summary(self) -> str:
         if not self.city:
@@ -267,13 +271,13 @@ class NewsItem:
     url: str = ""
     source: str = ""
     rank: int = 0
-    fetched_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    fetched_at: str = field(default_factory=now_iso)
 
 
 @dataclass(slots=True)
 class EnvSummary:
     """注入 System Prompt 的环境信息。"""
-    datetime_str: str = field(default_factory=lambda: datetime.now().strftime(
+    datetime_str: str = field(default_factory=lambda: clock_now().strftime(
         "%Y年%m月%d日 %A %H:%M"
     ))
     weather: WeatherInfo | None = None
@@ -328,6 +332,7 @@ class ModelLoadSection(BaseModel):
     llm_path: str = "models/llm/qwen2.5-7b-instruct-q4_k_m.gguf"
     n_ctx: int = Field(default=8192, gt=0)
     n_gpu_layers: int = Field(default=-1, ge=-1)
+    use_worker: bool = False  # True=子进程隔离, False=同进程加载
 
 
 class ModelSamplingSection(BaseModel):

@@ -115,8 +115,11 @@ def init_engine(config: "AppConfig"):
     初始化推理引擎 — 加载 GGUF 模型。
 
     这是整个系统唯一的硬依赖。
+    支持两种模式：
+      - 同进程模式 (默认): InferenceEngine，模型在主进程加载
+      - 子进程隔离: InferenceWorkerClient，模型在独立子进程运行（崩溃隔离）
     """
-    from mon3ter.core.engine import get_engine
+    from mon3ter.core.engine import InferenceEngine, InferenceWorkerClient
     from mon3ter.core.types import ModelLoadConfig
 
     mc = ModelLoadConfig(
@@ -125,7 +128,15 @@ def init_engine(config: "AppConfig"):
         n_gpu_layers=config.models.load.n_gpu_layers,
     )
 
-    engine = get_engine(mc)
+    use_worker = getattr(config.models.load, 'use_worker', False)
+
+    if use_worker:
+        engine = InferenceWorkerClient(mc)
+        logger.info("推理引擎模式: 子进程隔离 (worker)")
+    else:
+        engine = InferenceEngine(mc)
+        logger.info("推理引擎模式: 同进程")
+
     engine.load()
     logger.info("✅ 推理引擎就绪")
     return engine
@@ -207,7 +218,7 @@ def init_conversation(config: "AppConfig", engine, personality, memory, web_mod)
 # WebSocket 服务
 # ═══════════════════════════════════════════════════════════════════════
 
-async def start_server(config: "AppConfig", orchestrator, engine):
+async def start_server(config: "AppConfig", orchestrator, engine, personality):
     """启动 WebSocket 服务端。"""
     from mon3ter.core.types import SamplingParams
 
@@ -217,8 +228,10 @@ async def start_server(config: "AppConfig", orchestrator, engine):
     )
 
     try:
-        import server
-        await server.start(config.server, default_sampling, orchestrator, engine)
+        from mon3ter import server as server_mod
+        await server_mod.start(
+            config.server, default_sampling, orchestrator, engine, personality
+        )
     except ImportError:
         logger.error("❌ server.py 未实现，无法启动服务")
         raise
@@ -242,8 +255,7 @@ async def shutdown(engine, web_mod, exit_code: int = 0):
             pass
 
     if engine is not None:
-        from mon3ter.core.engine import reset_engine
-        reset_engine()
+        engine.unload()
 
     logger.info("Mon3ter 已关闭。")
     sys.exit(exit_code)
@@ -293,7 +305,7 @@ def main() -> None:
     asyncio.set_event_loop(loop)
 
     try:
-        loop.run_until_complete(start_server(config, orchestrator, engine))
+        loop.run_until_complete(start_server(config, orchestrator, engine, personality_mod))
     except KeyboardInterrupt:
         logger.info("收到中断信号")
     except Exception as exc:

@@ -5,3 +5,6 @@ Mon3ter — 本地 AI 桌面伴侣
 """
 
 __version__ = "0.1.0"
+
+# 导出顶层模块，方便外部使用
+from mon3ter import core, personality, memory, conversation, web, server

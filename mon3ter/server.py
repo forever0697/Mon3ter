@@ -19,6 +19,7 @@ from websockets.asyncio.server import serve
 from websockets.exceptions import ConnectionClosed
 
 from mon3ter.core.types import (
+    ConversationContext,
     InferenceRequest,
     Message,
     SamplingParams,
@@ -36,12 +37,12 @@ _active_clients: set[Any] = set()
 # 消息处理器
 # ═══════════════════════════════════════════════════════════════════════
 
-async def _handle_chat(websocket, payload: WSMessage, orchestrator, engine, default_sampling: SamplingParams) -> None:
+async def _handle_chat(websocket, payload: WSMessage, orchestrator, engine, personality, default_sampling: SamplingParams, ctx: ConversationContext | None) -> None:
     """
     处理聊天消息。
 
     优先使用 orchestrator（有记忆/人格/联网），
-    orchestrator 不可用时回退到引擎裸聊。
+    orchestrator 不可用时回退到引擎裸聊（但尽量注入 System Prompt）。
     """
     user_text = payload.content.strip()
     if not user_text:
@@ -54,13 +55,29 @@ async def _handle_chat(websocket, payload: WSMessage, orchestrator, engine, defa
             async for token in orchestrator.handle_message(user_text):
                 await websocket.send(WSMessage(type="token", content=token).to_json())
         else:
-            # ── 回退模式: 引擎裸聊 ──────────────────────────
+            # ── 回退模式: 引擎裸聊 + 基础上下文 ─────────────
+            user_msg = Message.user(user_text)
+
+            # 构建消息列表: System Prompt + 历史 + 当前消息
+            messages: list[Message] = []
+            if ctx is not None and ctx.prefix:
+                messages.extend(ctx.prefix)
+            if ctx is not None:
+                messages.extend(ctx.history)
+            messages.append(user_msg)
+
             request = InferenceRequest(
-                messages=[Message.user(user_text)],
+                messages=messages,
                 sampling=default_sampling,
             )
+            full_reply: list[str] = []
             async for token in engine.chat_stream_async(request):
+                full_reply.append(token)
                 await websocket.send(WSMessage(type="token", content=token).to_json())
+
+            # 将本轮对话写入上下文历史
+            if ctx is not None:
+                ctx.append(user_msg, Message.assistant("".join(full_reply)))
 
         # 消息结束
         await websocket.send(WSMessage(type="done", content="").to_json())
@@ -84,15 +101,31 @@ async def _handle_command(websocket, payload: WSMessage, orchestrator, engine) -
 # 连接处理器
 # ═══════════════════════════════════════════════════════════════════════
 
-async def _handler(websocket, orchestrator, engine, default_sampling: SamplingParams):
+async def _handler(websocket, orchestrator, engine, personality, default_sampling: SamplingParams):
     """
     每个 WebSocket 连接的生命周期。
 
     职责: 收消息 → 派发 → 推回复。不关心对话逻辑本身。
+
+    回退模式下会为每个连接维护独立的 ConversationContext，
+    确保对话历史在单次连接内持续存在。
     """
     client_id = f"{websocket.remote_address}"
     logger.info("客户端连接: %s", client_id)
     _active_clients.add(websocket)
+
+    # ── 回退模式: 构建基础上下文 ─────────────────────────────
+    ctx: ConversationContext | None = None
+    if orchestrator is None:
+        ctx = ConversationContext()
+        # 如果有 personality 引擎，用它生成 System Prompt
+        if personality is not None:
+            try:
+                system_prompt = personality.build_system_prompt()
+                ctx.prefix = [Message.system(system_prompt)]
+                logger.debug("回退模式已注入 System Prompt (%d chars)", len(system_prompt))
+            except Exception as exc:
+                logger.warning("回退模式 System Prompt 生成失败: %s", exc)
 
     mode_label = "full" if orchestrator else "fallback"
     await websocket.send(WSMessage(
@@ -114,7 +147,7 @@ async def _handler(websocket, orchestrator, engine, default_sampling: SamplingPa
             msg_type = payload.type
 
             if msg_type == "chat":
-                await _handle_chat(websocket, payload, orchestrator, engine, default_sampling)
+                await _handle_chat(websocket, payload, orchestrator, engine, personality, default_sampling, ctx)
 
             elif msg_type == "command":
                 await _handle_command(websocket, payload, orchestrator, engine)
@@ -162,6 +195,7 @@ async def start(
     default_sampling: SamplingParams,
     orchestrator=None,
     engine=None,
+    personality=None,
 ) -> None:
     """
     启动 WebSocket 服务端。
@@ -171,16 +205,20 @@ async def start(
         default_sampling: 回退模式的默认采样参数
         orchestrator: 对话管理器实例, None 时使用回退模式
         engine: 推理引擎实例 (回退模式需要)
+        personality: 人格引擎实例 (回退模式用于构建 System Prompt)
     """
     async def _h(websocket):
-        await _handler(websocket, orchestrator, engine, default_sampling)
+        await _handler(websocket, orchestrator, engine, personality, default_sampling)
 
     host = server_config.host
     port = server_config.port
 
     logger.info("WebSocket 服务启动: ws://%s:%d", host, port)
     if orchestrator is None:
-        logger.info("  模式: 回退 (引擎裸聊, 无记忆/人格/联网)")
+        parts = ["引擎裸聊"]
+        if personality is not None:
+            parts.append("有 System Prompt")
+        logger.info("  模式: 回退 (%s)", ", ".join(parts))
     else:
         logger.info("  模式: 完整 (对话管理器编排)")
 

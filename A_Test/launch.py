@@ -69,7 +69,7 @@ def main() -> None:
         line = line.rstrip()
         print(f"  [后端] {line}")
 
-        if "server listening" in line:
+        if "WebSocket 服务启动" in line or "server listening" in line:
             ready = True
             break
 
